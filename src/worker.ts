@@ -14,8 +14,8 @@
 
 interface Env {
   FLEET_KV: KVNamespace;
-  VESSELS: R2Bucket;
-  AGENT_HUB: DurableObjectNamespace;
+  VESSELS?: R2Bucket;
+  AGENT_HUB?: DurableObjectNamespace;
   VERSION: string;
   FLEET_NAME: string;
 }
@@ -202,17 +202,18 @@ async function handleDispatch(request: Request, env: Env, headers: Record<string
   const kvKey = `bottle:${bottle.target}:${bottle.id}`;
   await env.FLEET_KV.put(kvKey, JSON.stringify(bottle), { expirationTtl: bottle.ttl });
 
-  // Also store in R2 for durable log
-  await env.VESSELS.put(`outgoing/${bottle.id}.json`, JSON.stringify(bottle, null, 2), {
-    customMetadata: { target: bottle.target, action: bottle.action, status: bottle.status },
-  });
+  // Also store in R2 for durable log (if available)
+  if (env.VESSELS) {
+    await env.VESSELS.put(`outgoing/${bottle.id}.json`, JSON.stringify(bottle, null, 2), {
+      customMetadata: { target: bottle.target, action: bottle.action, status: bottle.status },
+    });
+  }
 
   // Update target agent's inbox index
   const inboxKey = `inbox:${bottle.target}`;
   const existingRaw = await env.FLEET_KV.get(inboxKey);
   const existing: string[] = existingRaw ? JSON.parse(existingRaw) : [];
   existing.push(bottle.id);
-  // Keep only last 100 bottles in inbox index
   const trimmed = existing.slice(-100);
   await env.FLEET_KV.put(inboxKey, JSON.stringify(trimmed), { expirationTtl: 86400 });
 
@@ -222,7 +223,7 @@ async function handleDispatch(request: Request, env: Env, headers: Record<string
   const metrics = metricsRaw ? JSON.parse(metricsRaw) : { count: 0, actions: {} };
   metrics.count++;
   metrics.actions[action] = (metrics.actions[action] || 0) + 1;
-  await env.FLEET_KV.put(metricsKey, JSON.stringify(metrics), { expirationTtl: 604800 }); // 7 days
+  await env.FLEET_KV.put(metricsKey, JSON.stringify(metrics), { expirationTtl: 604800 });
 
   return jsonResponse({
     ok: true,
@@ -312,10 +313,12 @@ async function handleBottleConfirm(bottleId: string, request: Request, env: Env,
 
   await env.FLEET_KV.put(kvKey, JSON.stringify(bottle), { expirationTtl: 3600 });
 
-  // Update R2 status
-  await env.VESSELS.put(`outgoing/${bottleId}.json`, JSON.stringify(bottle, null, 2), {
-    customMetadata: { target: bottle.target, action: bottle.action, status: bottle.status },
-  });
+  // Update R2 status (if available)
+  if (env.VESSELS) {
+    await env.VESSELS.put(`outgoing/${bottleId}.json`, JSON.stringify(bottle, null, 2), {
+      customMetadata: { target: bottle.target, action: bottle.action, status: bottle.status },
+    });
+  }
 
   return jsonResponse({ ok: true, bottle_id: bottleId, status: bottle.status }, headers);
 }
