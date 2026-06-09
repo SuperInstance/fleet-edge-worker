@@ -1,0 +1,27 @@
+name = "fleet-edge"
+main = "src/worker.ts"
+compatibility_date = "2024-12-01"
+
+[vars]
+VERSION = "0.1.0"
+FLEET_NAME = "superinstance"
+
+# KV for fleet state and bottle routing
+[[kv_namespaces]]
+binding = "FLEET_KV"
+id = "placeholder"
+
+# R2 for vessel bottle storage (persistent)
+[[r2_buckets]]
+binding = "VESSELS"
+bucket_name = "fleet-vessels"
+
+# Durable Object for real-time agent coordination
+[durable_objects]
+bindings = [
+  { name = "AGENT_HUB", class_name = "AgentHub" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["AgentHub"]
