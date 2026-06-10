@@ -16,8 +16,12 @@ interface Env {
   FLEET_KV: KVNamespace;
   VESSELS?: R2Bucket;
   AGENT_HUB?: DurableObjectNamespace;
+  VECTOR_API_SERVICE?: Fetcher;
+  VECTORIZE?: VectorizeIndex;
+  AI?: any; // Workers AI
   VERSION: string;
   FLEET_NAME: string;
+  VECTOR_API: string;
 }
 
 interface Bottle {
@@ -131,6 +135,16 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     // Route dispatch
     if (path === '/dispatch' && request.method === 'POST') {
       return await handleDispatch(request, env, corsHeaders);
+    }
+
+    // Smart dispatch — vector-aware routing
+    if (path === '/dispatch/smart' && request.method === 'POST') {
+      return await handleSmartDispatch(request, env, corsHeaders);
+    }
+
+    // Context lookup — semantic search proxy
+    if (path === '/context' && request.method === 'POST') {
+      return await handleContext(request, env, corsHeaders);
     }
 
     // Fleet status
@@ -385,6 +399,175 @@ export class AgentHub implements DurableObject {
     // Periodic cleanup of expired sessions
     this.sessions.clear();
   }
+}
+
+// ─── Smart Dispatch (vector-aware routing) ────────────────────────────
+
+interface VectorSearchResult {
+  id: string;
+  score: number;
+  description?: string;
+}
+
+async function handleSmartDispatch(request: Request, env: Env, headers: Record<string, string>): Promise<Response> {
+  const body = await request.json() as { query: string; payload?: Record<string, unknown>; topK?: number };
+  const { query, payload = {}, topK = 3 } = body;
+
+  if (!query) return jsonResponse({ error: 'Query required' }, headers, 400);
+
+  // Step 1: Find semantically similar crates via direct Vectorize
+  let searchResults: { results: VectorSearchResult[]; count: number } = { results: [], count: 0 };
+  
+  if (env.AI && env.VECTORIZE) {
+    try {
+      // Generate embedding with Workers AI
+      const embedResp: any = await env.AI.run('@cf/baai/bge-small-en-v1.5', {
+        text: [query],
+      });
+      const vector = embedResp.data[0];
+      
+      // Query Vectorize directly
+      const vMatches: any = await env.VECTORIZE.query(vector, { topK: topK * 2, returnMetadata: 'all' });
+      const vResults = Array.isArray(vMatches) ? vMatches : (vMatches.results || vMatches.matches || []);
+      searchResults = {
+        results: vResults.map((m: any) => ({
+          id: m.id,
+          score: m.score,
+          description: m.metadata?.description,
+        })),
+        count: vResults.length,
+      };
+    } catch (e) {
+      // Vectorize unavailable — fall back to direct routing
+    }
+  } else if (env.VECTOR_API_SERVICE) {
+    try {
+      const searchResp = await env.VECTOR_API_SERVICE.fetch(
+        new Request('https://fleet-vector-api.casey-digennaro.workers.dev/search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query, topK: topK * 2 }),
+        })
+      );
+      if (searchResp.ok) {
+        searchResults = await searchResp.json() as { results: VectorSearchResult[]; count: number };
+      }
+    } catch (e) {
+      // Service binding unavailable
+    }
+  }
+
+  // Step 2: Score agents by semantic similarity to crate capabilities
+  const agentScores: Record<string, number> = {};
+  for (const result of searchResults.results || []) {
+    const crateName = result.id;
+    for (const [agentName, agentPort] of Object.entries(AGENT_PORTS)) {
+      // Match by capability keywords
+      for (const cap of agentPort.capabilities) {
+        if (crateName.includes(cap) || crateName.includes(agentName.split('-')[0])) {
+          agentScores[agentName] = (agentScores[agentName] || 0) + result.score;
+        }
+      }
+      // Also match by crate name keywords to agent name
+      const agentKeywords: Record<string, string[]> = {
+        'fleet-midi': ['midi', 'music', 'chord', 'audio'],
+        'ghost-track': ['ghost', 'track', 'session', 'memory', 'temporal'],
+        'persona-engine': ['persona', 'identity', 'profile'],
+        'fleet-conductor': ['conductor', 'orchestrat', 'schedule', 'fleet', 'dispatch'],
+        'forgemaster': ['forge', 'build', 'generat', 'code'],
+        'oracle2': ['oracle', 'predict', 'inference', 'weather'],
+        'construct': ['construct', 'spatial', 'voxel', 'sheaf', 'cohomology', 'hodge', 'spectral', 'laplacian', 'constraint', 'ternary', 'conservation'],
+      };
+      const keywords = agentKeywords[agentName] || [];
+      for (const kw of keywords) {
+        if (crateName.includes(kw)) {
+          agentScores[agentName] = (agentScores[agentName] || 0) + result.score * 0.5;
+        }
+      }
+    }
+  }
+
+  // Step 3: Rank agents and pick the best
+  const ranked = Object.entries(agentScores)
+    .sort(([,a], [,b]) => b - a)
+    .map(([agent, score]) => ({ agent, score }));
+
+  if (ranked.length === 0) {
+    ranked.push({ agent: 'construct', score: 0 });
+  }
+
+  const bestAgent = ranked[0].agent;
+  const target = AGENT_PORTS[bestAgent] ? `${bestAgent}` : 'construct';
+
+  // Step 4: Create and dispatch bottle
+  const bottle: Bottle = {
+    id: crypto.randomUUID(),
+    timestamp: Date.now(),
+    source: 'smart-dispatch',
+    target,
+    action: query,
+    payload: { ...payload, _context: searchResults.results.slice(0, 5).map(r => r.id), _confidence: ranked[0].score },
+    status: 'outgoing',
+    ttl: 3600,
+  };
+
+  // Persist bottle
+  const kvKey = `bottle:${target}:${bottle.id}`;
+  await env.FLEET_KV.put(kvKey, JSON.stringify(bottle), { expirationTtl: bottle.ttl });
+
+  const inboxKey = `inbox:${target}`;
+  const existingRaw = await env.FLEET_KV.get(inboxKey);
+  const existing: string[] = existingRaw ? JSON.parse(existingRaw) : [];
+  existing.push(bottle.id);
+  await env.FLEET_KV.put(inboxKey, JSON.stringify(existing.slice(-100)), { expirationTtl: 86400 });
+
+  // Update metrics
+  const metricsKey = `metrics:smart:${new Date().toISOString().split('T')[0]}`;
+  const metricsRaw = await env.FLEET_KV.get(metricsKey);
+  const metrics = metricsRaw ? JSON.parse(metricsRaw) : { count: 0, queries: {} };
+  metrics.count++;
+  metrics.queries[query.slice(0, 50)] = (metrics.queries[query.slice(0, 50)] || 0) + 1;
+  await env.FLEET_KV.put(metricsKey, JSON.stringify(metrics), { expirationTtl: 604800 });
+
+  return jsonResponse({
+    ok: true,
+    query,
+    routed_to: target,
+    confidence: ranked[0].score,
+    context_crates: searchResults.results.slice(0, 5).map((r: any) => ({ name: r.id, score: r.score })),
+    ranked_agents: ranked.slice(0, 5),
+    bottle: { id: bottle.id, target, status: bottle.status },
+  }, headers);
+}
+
+// ─── Context Lookup ──────────────────────────────────────────────────────
+
+async function handleContext(request: Request, env: Env, headers: Record<string, string>): Promise<Response> {
+  const { query, topK = 10 } = await request.json() as { query: string; topK?: number };
+  if (!query) return jsonResponse({ error: 'Query required' }, headers, 400);
+
+  // Direct Vectorize query
+  if (env.AI && env.VECTORIZE) {
+    try {
+      const embedResp: any = await env.AI.run('@cf/baai/bge-small-en-v1.5', { text: [query] });
+      const vector = embedResp.data[0];
+      const matches: any = await env.VECTORIZE.query(vector, { topK, returnMetadata: 'all' });
+      const results = Array.isArray(matches) ? matches : (matches.results || matches.matches || []);
+      return jsonResponse({
+        query,
+        results: results.map((m: any) => ({
+          name: m.id,
+          score: m.score,
+          description: m.metadata?.description,
+        })),
+        count: results.length,
+        powered_by: 'direct-vectorize',
+      }, headers);
+    } catch (e: any) {
+      return jsonResponse({ error: `Vectorize error: ${e.message}` }, headers, 500);
+    }
+  }
+  return jsonResponse({ error: 'Vectorize not configured' }, headers, 501);
 }
 
 // ─── Export ────────────────────────────────────────────────────────────────

@@ -4,8 +4,17 @@ compatibility_date = "2024-12-01"
 account_id = "049ff5e84ecf636b53b162cbb580aae6"
 
 [vars]
-VERSION = "0.1.0"
+VERSION = "0.3.1"
 FLEET_NAME = "superinstance"
+
+# Direct Vectorize access
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "fleet-crates"
+
+# Workers AI for embeddings
+[ai]
+binding = "AI"
 
 [[kv_namespaces]]
 binding = "FLEET_KV"
