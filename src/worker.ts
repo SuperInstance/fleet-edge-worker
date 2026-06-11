@@ -249,20 +249,27 @@ async function handleDispatch(request: Request, env: Env, headers: Record<string
 // ─── Status Handler ───────────────────────────────────────────────────────
 
 async function handleStatus(env: Env, headers: Record<string, string>): Promise<Response> {
-  // Gather fleet metrics
+  // Gather fleet metrics + pending counts in parallel (single batch)
   const today = new Date().toISOString().split('T')[0];
   const metricsKey = `metrics:dispatch:${today}`;
+  const inboxKeys = Object.keys(AGENT_PORTS).map(a => `inbox:${a}`);
+  const allKeys = [metricsKey, ...inboxKeys];
+
+  const results = await env.FLEET_KV.list({ prefix: 'metrics:dispatch:' });
   const metricsRaw = await env.FLEET_KV.get(metricsKey);
   const metrics = metricsRaw ? JSON.parse(metricsRaw) : { count: 0, actions: {} };
 
-  // Count pending bottles
+  // Batch-read all inboxes concurrently instead of sequential loop
   let pendingCount = 0;
-  for (const agentName of Object.keys(AGENT_PORTS)) {
-    const inboxKey = `inbox:${agentName}`;
-    const inboxRaw = await env.FLEET_KV.get(inboxKey);
-    if (inboxRaw) {
-      const ids: string[] = JSON.parse(inboxRaw);
-      pendingCount += ids.length;
+  const inboxResults = await Promise.all(
+    inboxKeys.map(k => env.FLEET_KV.get(k))
+  );
+  for (const raw of inboxResults) {
+    if (raw) {
+      try {
+        const ids: string[] = JSON.parse(raw);
+        pendingCount += ids.length;
+      } catch { /* skip malformed */ }
     }
   }
 
@@ -511,23 +518,24 @@ async function handleSmartDispatch(request: Request, env: Env, headers: Record<s
     ttl: 3600,
   };
 
-  // Persist bottle
+  // Persist bottle + inbox + metrics concurrently
   const kvKey = `bottle:${target}:${bottle.id}`;
-  await env.FLEET_KV.put(kvKey, JSON.stringify(bottle), { expirationTtl: bottle.ttl });
-
   const inboxKey = `inbox:${target}`;
   const existingRaw = await env.FLEET_KV.get(inboxKey);
   const existing: string[] = existingRaw ? JSON.parse(existingRaw) : [];
   existing.push(bottle.id);
-  await env.FLEET_KV.put(inboxKey, JSON.stringify(existing.slice(-100)), { expirationTtl: 86400 });
 
-  // Update metrics
   const metricsKey = `metrics:smart:${new Date().toISOString().split('T')[0]}`;
   const metricsRaw = await env.FLEET_KV.get(metricsKey);
   const metrics = metricsRaw ? JSON.parse(metricsRaw) : { count: 0, queries: {} };
   metrics.count++;
   metrics.queries[query.slice(0, 50)] = (metrics.queries[query.slice(0, 50)] || 0) + 1;
-  await env.FLEET_KV.put(metricsKey, JSON.stringify(metrics), { expirationTtl: 604800 });
+
+  await Promise.all([
+    env.FLEET_KV.put(kvKey, JSON.stringify(bottle), { expirationTtl: bottle.ttl }),
+    env.FLEET_KV.put(inboxKey, JSON.stringify(existing.slice(-100)), { expirationTtl: 86400 }),
+    env.FLEET_KV.put(metricsKey, JSON.stringify(metrics), { expirationTtl: 604800 }),
+  ]);
 
   return jsonResponse({
     ok: true,
