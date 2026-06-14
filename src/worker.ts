@@ -175,6 +175,18 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       return await handleBottleConfirm(bottleId, request, env, corsHeaders);
     }
 
+    // Baton bridge — Loom I2I protocol ingress
+    if (path === '/baton' && request.method === 'POST') {
+      const { handleBatonRequest } = await import('./baton-bridge');
+      return await handleBatonRequest(request, env as any, corsHeaders);
+    }
+
+    // Baton response — return path for Loom delivery
+    if (path === '/baton/response' && request.method === 'POST') {
+      const { handleBatonResponse } = await import('./baton-bridge');
+      return await handleBatonResponse(request, env as any, corsHeaders);
+    }
+
     // Health check
     if (path === '/health') {
       return jsonResponse({
