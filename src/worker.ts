@@ -10,6 +10,10 @@
  * Conservation law: every action in = exactly one bottle out (γ + η = C)
  */
 
+// ─── Governor Import ────────────────────────────────────────────────────
+
+import { handleGovernorStatus, handleGovernorTick, handleGovernorConfig } from './pid-governor';
+
 // ─── Types ────────────────────────────────────────────────────────────────
 
 interface Env {
@@ -185,6 +189,21 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     if (path === '/baton/response' && request.method === 'POST') {
       const { handleBatonResponse } = await import('./baton-bridge');
       return await handleBatonResponse(request, env as any, corsHeaders);
+    }
+
+    // PID Fleet Governor — status
+    if (path === '/governor' && request.method === 'GET') {
+      return await handleGovernorStatus(env, corsHeaders);
+    }
+
+    // PID Fleet Governor — run a tick (cron or manual)
+    if (path === '/governor/tick' && request.method === 'POST') {
+      return await handleGovernorTick(env, corsHeaders);
+    }
+
+    // PID Fleet Governor — update config
+    if (path === '/governor/config' && request.method === 'POST') {
+      return await handleGovernorConfig(request, env, corsHeaders);
     }
 
     // Health check
